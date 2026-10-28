@@ -5,9 +5,9 @@
 [![GDS Flow](https://github.com/VarunKB06/cnn-tiny-tapeout/actions/workflows/gds.yaml/badge.svg?branch=main)](https://github.com/VarunKB06/cnn-tiny-tapeout/actions/workflows/gds.yaml)
 [![Tiny Tapeout FPGA Build](https://github.com/VarunKB06/cnn-tiny-tapeout/actions/workflows/fpga.yaml/badge.svg?branch=main)](https://github.com/VarunKB06/cnn-tiny-tapeout/actions/workflows/fpga.yaml)
 
-A Tiny Tapeout / SKY130 RTL project implementing a resource-shared 4×4 signed INT4 matrix-multiplication accelerator. Instead of instantiating sixteen processing elements (PEs), the design reuses four PEs to calculate one element of the output matrix `C = A × B` at a time. Matrix B is stored while rows of matrix A are loaded and processed sequentially.
+A Tiny Tapeout / SKY130 RTL project implementing a resource-shared 4×4 signed INT4 matrix-multiplication accelerator. The design computes `C = A × B` using four processing elements (PEs), reused to calculate one output element at a time. Matrix B is loaded and retained while rows of matrix A are streamed sequentially.
 
-> **Architecture scope:** This design implements 4×4 matrix multiplication using four reused PEs. It is not a fully parallel 16-PE systolic array or a complete CNN convolution pipeline.
+> **Architecture scope:** The RTL module is named `systolic_array`, and the four PEs form a registered 1×4 partial-sum/MAC chain. However, the overall accelerator is **not a conventional fully parallel 2D systolic array**: it time-multiplexes that chain across output columns and rows. It is a resource-shared, systolic-style dot-product datapath, not a 16-PE array or a complete CNN convolution pipeline.
 
 ## Highlights
 
@@ -21,7 +21,7 @@ A Tiny Tapeout / SKY130 RTL project implementing a resource-shared 4×4 signed I
 
 ## Architecture
 
-Each PE contains a signed 4-bit multiplier, a signed accumulator, and registered feature forwarding. For each row `r` of matrix A and column `c` of matrix B, the controller selects the four elements of the corresponding row and column. The four PEs calculate the dot product for `C[r][c]`. The same PEs are reused for the next column and row.
+For each output element `C[r][c]`, the controller selects the four values in row `A[r]` and the four values in column `B[:,c]`. Each PE multiplies one corresponding pair and passes a registered partial sum to the next PE. The fourth PE holds the completed 10-bit result while the host reads its two bytes. After the host advances, the same four PEs are cleared and reused for the next column, then the next row. The feature-forwarding output exists in the PE module but is not used to move A data between PEs in this matrix mode.
 
 ```mermaid
 flowchart TD
@@ -32,10 +32,10 @@ flowchart TD
     AR["Selected row of A"]
     BC["Selected column of B"]
 
-    PE0["PE 0: first product"]
-    PE1["PE 1: second product"]
-    PE2["PE 2: third product"]
-    PE3["PE 3: fourth product"]
+    PE0["PE 0: product + initial partial sum"]
+    PE1["PE 1: product + registered partial sum"]
+    PE2["PE 2: product + registered partial sum"]
+    PE3["PE 3: product + final partial sum"]
 
     SUM["Accumulate four products"]
     C["Output element C[r][c]"]
@@ -159,52 +159,39 @@ Across all four rows, the result matrix contains 16 elements, corresponding to 3
 
 The result-ready signal indicates readiness for the current element; it should not be interpreted as a flag that necessarily remains asserted until every byte of the complete matrix has been read.
 
-## Verification
+## Verification and current physical-design results
 
-The Cocotb regression is intended to cover:
+The Cocotb regression in `test/test.py` defines six tests:
 
-- 4×4 signed INT4 matrix multiplication.
-- Completion behavior while `ena` is low.
-- Status signals and result-byte ordering.
-- Reset recovery.
-- Repeated transactions without reset.
-- Deterministic randomized matrix pairs using seed `0xC0C07B`.
+| Test | Coverage |
+|---|---|
+| `test_int4_matrix_multiply_4x4` | Directed signed-INT4 matrix cases; compares all 16 results against a Python reference model. |
+| `test_ena_low_during_completion` | Checks that result-ready is retained if an element completes while `ena` is low. |
+| `test_status_signals` | Checks busy/result-valid status, output-enable, reserved bits, and byte ordering. |
+| `test_reset_during_compute_and_recovery` | Checks reset during computation and recovery. |
+| `test_repeated_transactions_without_reset` | Checks back-to-back matrix transactions without an intervening reset. |
+| `test_deterministic_randomized_matrices` | Checks reproducible randomized matrices using seed `0xC0C07B`. |
 
-The functional tests should compare all 16 output elements against a Python reference model.
+Run the test suite against the exact revision intended for tapeout:
 
-Run the regression against the current RTL before relying on any earlier test results. A successful test on an earlier non-matrix implementation does not verify the current matrix-multiplication implementation.
+```sh
+cd test
+make clean
+make
+python -m cocotb_tools.check_results results.xml
+```
 
-- [Test workflow](https://github.com/VarunKB06/cnn-tiny-tapeout/actions/workflows/test.yaml)
-- [Previously tested commit `98a19b3`](https://github.com/VarunKB06/cnn-tiny-tapeout/commit/98a19b3)
+A test result is verified only when the current revision's regression completes with zero failures. Use the [RTL test workflow](https://github.com/VarunKB06/cnn-tiny-tapeout/actions/workflows/test.yaml) to inspect the run corresponding to the commit being evaluated.
 
-The GDS workflow includes a gate-level test. The physical-design results below belong to an earlier project revision and are included for historical reference only. They must not be interpreted as measurements or verification results for the current matrix-multiplication RTL.
+### GDS / physical-design status
 
-## Historical physical-design snapshot (previous RTL revision)
+Use the [GDS workflow](https://github.com/VarunKB06/cnn-tiny-tapeout/actions/workflows/gds.yaml) and open the run for the **same commit as the current matrix-multiplication RTL**. That workflow runs the GDS build, Tiny Tapeout precheck, gate-level test, and viewer deployment.
 
-The following figures are from [GDS workflow run 38365315668](https://github.com/VarunKB06/cnn-tiny-tapeout/actions/runs/38365315668), commit [`162f691`](https://github.com/VarunKB06/cnn-tiny-tapeout/commit/162f691557bef0d33352218c2a7ba2ffdda59a8d). These are EDA flow results, not measurements from fabricated silicon.
+**No numeric area, timing, DRC, LVS, antenna, or gate-level pass figures are reproduced here from the older RTL revision.** The uploaded project archive does not contain the report artifacts for a new matrix-RTL run, so copying old metrics into this section would incorrectly attribute them to the current design. After opening the latest successful run, add only metrics confirmed by its artifacts, together with the run URL and full commit SHA.
 
-| Metric | Recorded result |
-|---|---:|
-| Standard-cell area | 13,088.8 µm² |
-| Core area | 16,493.3 µm² |
-| Core utilization | 79.36% |
-| Worst setup slack | +6.292 ns |
-| Worst hold slack | +0.115 ns |
-| Setup / hold violation counts | 0 / 0 |
-| Max-slew violations under configured 1.5 ns constraint | 0 |
-| Max-capacitance violations | 0 |
-| Max-fanout violations | 1 |
-| Reported Magic DRC errors | 0 |
-| Reported LVS device/net differences | 0 / 0 |
-| Antenna violations | 0 |
+The current `src/config.json` sets `RUN_KLAYOUT_DRC` to `0`; therefore KLayout DRC is disabled in this configuration. Do not report KLayout DRC as passed unless it is run separately. Distinguish Magic DRC, LVS, antenna checks, gate-level simulation, and Tiny Tapeout precheck because they are separate checks.
 
-**Known item under review:** The historical run reported one max-fanout violation on the root clock buffer (`clkbuf_0_clk/X`), which drove 16 loads against the configured fanout limit of 10.
-
-The configured 1.5 ns maximum-transition constraint changes the checking threshold; it should not be described as physically reducing the signal transition time.
-
-The configuration sets `RUN_KLAYOUT_DRC: 0`. Therefore, KLayout DRC was not run in that configuration and should not be described as passed.
-
-For reproducibility, retain the run URL, full commit SHA, `src/config.json`, `info.yaml`, and the corresponding GDS logs with future reports.
+Physical-design results are EDA estimates and checks, not measurements from fabricated silicon. Keep `src/config.json` and `info.yaml` with the report so the run can be reproduced.
 
 ## Repository layout
 
