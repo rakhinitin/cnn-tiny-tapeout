@@ -71,13 +71,14 @@ endmodule
 //   C[r][c] = A[r][0]*B[0][c] + A[r][1]*B[1][c]
 //           + A[r][2]*B[2][c] + A[r][3]*B[3][c]
 //
-// The four PEs form a registered 1x4 MAC chain. PE k multiplies
-// A[r][k] by B[k][c] and adds the partial sum from PE k-1.
-// row_select / col_select pick which C[r][c] is being computed.
+// Weight-stationary: all of B is held on chip, A is streamed in one
+// row at a time (a_row_flat = A[r][0..3]). The four PEs form a
+// registered 1x4 MAC chain. PE k multiplies A[r][k] by B[k][c] and adds
+// the partial sum from PE k-1. col_select picks the column c of B.
 //
-// Flat matrix packing (element i occupies bits [i*W +: W]):
-//   a_flat index = r*4 + k   (row-major)
-//   b_flat index = k*4 + c   (row-major)
+// Flat packing (element i occupies bits [i*W +: W]):
+//   a_row_flat index = k        (A[r][k] for the current row r)
+//   b_flat     index = k*4 + c  (B[k][c], row-major)
 // ============================================================
 module systolic_array #(
     parameter DATA_WIDTH = 4,
@@ -87,31 +88,30 @@ module systolic_array #(
     input wire rst,
     input wire clear,
     input wire compute_en,
-    input wire [1:0] row_select,
     input wire [1:0] col_select,
 
-    input wire [16*DATA_WIDTH-1:0] a_flat,
+    input wire [4*DATA_WIDTH-1:0]  a_row_flat,
     input wire [16*DATA_WIDTH-1:0] b_flat,
 
     output wire signed [ACC_WIDTH-1:0] elem_result
 );
 
-    // Row r of A:  A[r][0..3]
+    // Current row of A:  A[r][0..3]
     wire signed [DATA_WIDTH-1:0] feature_0;
     wire signed [DATA_WIDTH-1:0] feature_1;
     wire signed [DATA_WIDTH-1:0] feature_2;
     wire signed [DATA_WIDTH-1:0] feature_3;
 
-    // Column c of B:  B[0..3][c]
+    // Selected column of B:  B[0..3][c]
     wire signed [DATA_WIDTH-1:0] weight_0;
     wire signed [DATA_WIDTH-1:0] weight_1;
     wire signed [DATA_WIDTH-1:0] weight_2;
     wire signed [DATA_WIDTH-1:0] weight_3;
 
-    assign feature_0 = a_flat[{row_select, 2'd0} * DATA_WIDTH +: DATA_WIDTH];
-    assign feature_1 = a_flat[{row_select, 2'd1} * DATA_WIDTH +: DATA_WIDTH];
-    assign feature_2 = a_flat[{row_select, 2'd2} * DATA_WIDTH +: DATA_WIDTH];
-    assign feature_3 = a_flat[{row_select, 2'd3} * DATA_WIDTH +: DATA_WIDTH];
+    assign feature_0 = a_row_flat[0*DATA_WIDTH +: DATA_WIDTH];
+    assign feature_1 = a_row_flat[1*DATA_WIDTH +: DATA_WIDTH];
+    assign feature_2 = a_row_flat[2*DATA_WIDTH +: DATA_WIDTH];
+    assign feature_3 = a_row_flat[3*DATA_WIDTH +: DATA_WIDTH];
 
     assign weight_0  = b_flat[{2'd0, col_select} * DATA_WIDTH +: DATA_WIDTH];
     assign weight_1  = b_flat[{2'd1, col_select} * DATA_WIDTH +: DATA_WIDTH];
@@ -128,8 +128,8 @@ module systolic_array #(
     wire signed [ACC_WIDTH-1:0] psum_2;
 
     // PE k receives its own A element, so the chain forms a true dot
-    // product (A[r][k] differs per PE). The data_out forwarding port of
-    // the PE is not needed in this arrangement and is left unconnected.
+    // product. The PE data_out forwarding port is not needed here and is
+    // left unconnected (its registers are removed by synthesis).
     pe #(
         .DATA_WIDTH(DATA_WIDTH),
         .ACC_WIDTH(ACC_WIDTH)
@@ -192,8 +192,10 @@ endmodule
 
 
 // ============================================================
-// Controller: walks through all 16 elements of C (row-major)
-// Per element: CLEAR (1) + COMPUTE (4) + CAPTURE (1) = 6 cycles
+// Controller: computes the four elements C[r][0..3] of one row.
+// Per element: CLEAR (1) + COMPUTE (4) + HOLD (until the host has
+// read the result). The result stays in the last PE during HOLD, so
+// no separate result registers are needed.
 // ============================================================
 module controller_fsm #(
     parameter COMPUTE_CYCLES = 4
@@ -201,25 +203,23 @@ module controller_fsm #(
     input  wire clk,
     input  wire rst,
     input  wire start,
+    input  wire advance,      // host finished reading the current element
 
     output wire compute_en,
     output wire clear,
-    output wire [1:0] row_select,
     output wire [1:0] col_select,
-    output wire capture,
-    output wire done,
+    output wire elem_valid,   // current element is ready and held
+    output wire last_col,     // current element is column 3
     output wire busy
 );
 
     // Controller states
-    localparam IDLE      = 3'd0;
-    localparam CLEAR_ROW = 3'd1;
-    localparam COMPUTE   = 3'd2;
-    localparam CAPTURE   = 3'd3;
-    localparam FINISH    = 3'd4;
+    localparam IDLE       = 2'd0;
+    localparam CLEAR_ELEM = 2'd1;
+    localparam COMPUTE    = 2'd2;
+    localparam HOLD       = 2'd3;
 
-    reg [2:0] state;
-    reg [1:0] row_index;
+    reg [1:0] state;
     reg [1:0] col_index;
 
     localparam COUNT_WIDTH =
@@ -232,17 +232,15 @@ module controller_fsm #(
 
     // Control signals for the PE array
     assign compute_en = (state == COMPUTE);
-    assign clear      = (state == CLEAR_ROW);
-    assign row_select = row_index;
+    assign clear      = (state == CLEAR_ELEM);
     assign col_select = col_index;
-    assign capture    = (state == CAPTURE);
-    assign done       = (state == FINISH);
-    assign busy       = (state != IDLE) && (state != FINISH);
+    assign elem_valid = (state == HOLD);
+    assign last_col   = (col_index == 2'd3);
+    assign busy       = (state == CLEAR_ELEM) || (state == COMPUTE);
 
     always @(posedge clk) begin
         if (rst) begin
             state       <= IDLE;
-            row_index   <= 2'd0;
             col_index   <= 2'd0;
             cycle_count <= 0;
         end
@@ -250,16 +248,15 @@ module controller_fsm #(
             case (state)
 
                 IDLE: begin
-                    row_index   <= 2'd0;
                     col_index   <= 2'd0;
                     cycle_count <= 0;
 
                     if (start)
-                        state <= CLEAR_ROW;
+                        state <= CLEAR_ELEM;
                 end
 
                 // Clear all four PEs before processing a new element.
-                CLEAR_ROW: begin
+                CLEAR_ELEM: begin
                     cycle_count <= 0;
                     state       <= COMPUTE;
                 end
@@ -269,42 +266,25 @@ module controller_fsm #(
                 COMPUTE: begin
                     if (cycle_count == LAST_CYCLE) begin
                         cycle_count <= 0;
-                        state       <= CAPTURE;
+                        state       <= HOLD;
                     end
                     else begin
                         cycle_count <= cycle_count + 1'b1;
                     end
                 end
 
-                // The top module captures elem_result while capture
-                // is asserted. Advance column first, then row.
-                CAPTURE: begin
-                    if (col_index == 2'd3) begin
-                        col_index <= 2'd0;
-
-                        if (row_index == 2'd3) begin
-                            state <= FINISH;
+                // Result is held in the last PE until the host reads it.
+                HOLD: begin
+                    if (advance) begin
+                        if (col_index == 2'd3) begin
+                            col_index <= 2'd0;
+                            state     <= IDLE;
                         end
                         else begin
-                            row_index <= row_index + 1'b1;
-                            state     <= CLEAR_ROW;
+                            col_index <= col_index + 1'b1;
+                            state     <= CLEAR_ELEM;
                         end
                     end
-                    else begin
-                        col_index <= col_index + 1'b1;
-                        state     <= CLEAR_ROW;
-                    end
-                end
-
-                FINISH: begin
-                    state <= IDLE;
-                end
-
-                default: begin
-                    state       <= IDLE;
-                    row_index   <= 2'd0;
-                    col_index   <= 2'd0;
-                    cycle_count <= 0;
                 end
 
             endcase
@@ -317,7 +297,7 @@ endmodule
 
 
 // ============================================================
-// Accelerator core: C = A x B  (4x4 signed INT4 matrices)
+// Accelerator core: one row of C = A x B per START
 // ============================================================
 module cnn_accelerator_top #(
     parameter DATA_WIDTH     = 4,
@@ -327,29 +307,24 @@ module cnn_accelerator_top #(
     input wire clk,
     input wire rst,
     input wire start,
+    input wire advance,
 
-    // Matrix A (features), row-major: index = r*4 + k
-    input wire [16*DATA_WIDTH-1:0] a_flat,
-    // Matrix B (weights),  row-major: index = k*4 + c
+    // Current row of A: A[r][0..3]
+    input wire [4*DATA_WIDTH-1:0]  a_row_flat,
+    // Matrix B (weights), row-major: index = k*4 + c
     input wire [16*DATA_WIDTH-1:0] b_flat,
 
-    // Matrix C (result),   row-major: index = r*4 + c
-    output reg  [16*ACC_WIDTH-1:0] c_flat,
+    // Current element C[r][c], held while elem_valid is high
+    output wire signed [ACC_WIDTH-1:0] elem_result,
 
-    output wire output_valid,
-    output wire done,
+    output wire elem_valid,
+    output wire last_col,
     output wire busy
 );
 
-    // Controller-to-array signals
     wire compute_en;
     wire clear;
-    wire capture;
-    wire [1:0] row_select;
     wire [1:0] col_select;
-
-    // Result from the reusable four-PE MAC chain
-    wire signed [ACC_WIDTH-1:0] elem_result;
 
     controller_fsm #(
         .COMPUTE_CYCLES(COMPUTE_CYCLES)
@@ -357,12 +332,12 @@ module cnn_accelerator_top #(
         .clk(clk),
         .rst(rst),
         .start(start),
+        .advance(advance),
         .compute_en(compute_en),
         .clear(clear),
-        .row_select(row_select),
         .col_select(col_select),
-        .capture(capture),
-        .done(done),
+        .elem_valid(elem_valid),
+        .last_col(last_col),
         .busy(busy)
     );
 
@@ -374,26 +349,11 @@ module cnn_accelerator_top #(
         .rst(rst),
         .clear(clear),
         .compute_en(compute_en),
-        .row_select(row_select),
         .col_select(col_select),
-        .a_flat(a_flat),
+        .a_row_flat(a_row_flat),
         .b_flat(b_flat),
         .elem_result(elem_result)
     );
-
-    // Store each C[r][c] in its own slot.
-    always @(posedge clk) begin
-        if (rst) begin
-            c_flat <= {(16*ACC_WIDTH){1'b0}};
-        end
-        else if (capture) begin
-            c_flat[{row_select, col_select} * ACC_WIDTH +: ACC_WIDTH]
-                <= elem_result;
-        end
-    end
-
-    // Results become valid when all sixteen elements are complete.
-    assign output_valid = done;
 
 endmodule
 
@@ -403,12 +363,21 @@ endmodule
 // ============================================================
 // Tiny Tapeout wrapper
 //
-// Protocol (unchanged):  uio_in[1:0]  00=IDLE 01=LOAD 10=START 11=READ
+// Computes C = A x B for 4x4 signed INT4 matrices.
+// Weight-stationary: B is loaded once, A is streamed one row at a time.
 //
-// LOAD  x32 : A[0][0..3], A[1][0..3], A[2][0..3], A[3][0..3]   (16 values)
-//             B[0][0..3], B[1][0..3], B[2][0..3], B[3][0..3]   (16 values)
-// START x1
-// READ  x32 : C[0][0] lo,hi, C[0][1] lo,hi, ... C[3][3] lo,hi (row-major)
+// Protocol (uio_in[1:0]): 00=IDLE 01=LOAD 10=START 11=READ
+//
+//   LOAD x16 : B[0][0..3], B[1][0..3], B[2][0..3], B[3][0..3]
+//   then, for each row r = 0..3 of A:
+//     LOAD x4  : A[r][0..3]
+//     START
+//     for each column c = 0..3:
+//        wait for result-valid (uio_out[3])
+//        READ x2 : C[r][c] low byte, then high byte
+//
+// After the 4th row has been read, B is released and the next matrix
+// multiply starts again with 16 B loads.
 // ============================================================
 module tt_um_cnn_accelerator (
     input  wire       clk,
@@ -434,40 +403,39 @@ module tt_um_cnn_accelerator (
     localparam ST_OUTPUT  = 2'b10;
 
     reg [1:0] state;
-    reg [4:0] load_count;     // 0..31
-    reg [4:0] output_count;   // 0..31
-    reg       inputs_loaded;
+    reg [3:0] load_count;      // 0..15 while loading B, 0..3 for an A row
+    reg       byte_sel;        // 0 = low byte, 1 = high byte
+    reg [1:0] row_count;       // rows of C finished so far
+    reg       weights_loaded;  // B is loaded
+    reg       inputs_loaded;   // current A row is loaded
 
-    // 4x4 signed INT4 matrices, row-major packed
-    reg [63:0] a_flat;        // A[r][k] -> index r*4 + k
-    reg [63:0] b_flat;        // B[k][c] -> index k*4 + c
+    // Stored operands (no reset needed: always fully loaded before use)
+    reg [15:0] a_row;          // A[r][0..3], index k
+    reg [63:0] b_flat;         // B[k][c], index k*4 + c
 
     reg start;
 
-    // 4x4 signed 10-bit result matrix, row-major packed
-    wire [159:0] c_flat;
-
-    wire output_valid;
-    wire done;
+    wire signed [9:0] elem_result;
+    wire elem_valid;
+    wire last_col;
     wire busy;
 
-    // Sticky wrapper-level completion status. The controller's done signal
-    // is a one-cycle pulse, but the Tiny Tapeout wrapper can be paused by
-    // ena. Latch completion even while ena is low so the wrapper cannot
-    // miss the pulse and remain stuck in ST_COMPUTE.
+    // The host finishes an element by reading its high byte.
+    wire advance;
+    assign advance = ena && (state == ST_OUTPUT) &&
+                     (uio_in[1:0] == CMD_READ) && byte_sel;
+
+    // Sticky wrapper-level completion status. elem_valid is held by the
+    // controller until the host reads the element, but latch it anyway so
+    // result-valid stays stable while ena is low.
     reg result_ready;
     wire result_valid_status;
-    assign result_valid_status = output_valid | result_ready;
+    assign result_valid_status = elem_valid | result_ready;
 
     // Status pins: bit 2 = busy, bit 3 = result-valid/ready.
-    // Keep bit 3 asserted until all thirty-two result bytes have been read.
     assign uio_out = {4'b0000, result_valid_status, busy, 2'b00};
     assign uio_oe  = 8'b0000_1100;
 
-    // ------------------------------------------------
-    // Resource-shared 4x4 INT4 matrix-multiply accelerator
-    // Four PEs reused for the sixteen elements of C
-    // ------------------------------------------------
     cnn_accelerator_top #(
         .DATA_WIDTH(4),
         .ACC_WIDTH(10),
@@ -476,107 +444,122 @@ module tt_um_cnn_accelerator (
         .clk(clk),
         .rst(~rst_n),
         .start(start),
-        .a_flat(a_flat),
+        .advance(advance),
+        .a_row_flat(a_row),
         .b_flat(b_flat),
-        .c_flat(c_flat),
-        .output_valid(output_valid),
-        .done(done),
+        .elem_result(elem_result),
+        .elem_valid(elem_valid),
+        .last_col(last_col),
         .busy(busy)
     );
 
-    // ------------------------------------------------
-    // Input loading and command control
-    //
-    // load_count 0..15  -> A (row-major)
-    // load_count 16..31 -> B (row-major)
-    //
-    // INT4 input is ui_in[3:0].
-    // Each command is one clock cycle, followed by IDLE.
-    // ------------------------------------------------
     always @(posedge clk) begin
         if (!rst_n) begin
-            state         <= ST_LOAD;
-            load_count    <= 5'd0;
-            output_count  <= 5'd0;
-            inputs_loaded <= 1'b0;
-            result_ready  <= 1'b0;
-
-            a_flat <= 64'd0;
-            b_flat <= 64'd0;
-
-            start <= 1'b0;
+            state          <= ST_LOAD;
+            load_count     <= 4'd0;
+            byte_sel       <= 1'b0;
+            row_count      <= 2'd0;
+            weights_loaded <= 1'b0;
+            inputs_loaded  <= 1'b0;
+            result_ready   <= 1'b0;
+            start          <= 1'b0;
         end
         else begin
             // Default: one-cycle start pulse
             start <= 1'b0;
 
-            // Do not gate completion capture with ena. The core continues
-            // to run while ena is low, so done may pulse during that time.
-            // result_ready persists until the host has read all result bytes.
-            if (done)
+            // Do not gate completion capture with ena. The core keeps
+            // running while ena is low, so latch that an element is ready.
+            if (elem_valid)
                 result_ready <= 1'b1;
 
             if (ena) begin
                 case (state)
 
                     ST_LOAD: begin
-                        if ((uio_in[1:0] == CMD_LOAD) &&
-                            !inputs_loaded) begin
+                        if (uio_in[1:0] == CMD_LOAD) begin
+                            if (!weights_loaded) begin
+                                // 16 loads fill B, row-major
+                                b_flat[{load_count, 2'b00} +: 4] <= ui_in[3:0];
 
-                            if (!load_count[4])
-                                a_flat[{load_count[3:0], 2'b00} +: 4] <= ui_in[3:0];
-                            else
-                                b_flat[{load_count[3:0], 2'b00} +: 4] <= ui_in[3:0];
-
-                            if (load_count == 5'd31) begin
-                                inputs_loaded <= 1'b1;
-                                load_count    <= 5'd0;
+                                if (load_count == 4'd15) begin
+                                    weights_loaded <= 1'b1;
+                                    load_count     <= 4'd0;
+                                end
+                                else begin
+                                    load_count <= load_count + 1'b1;
+                                end
                             end
-                            else begin
-                                load_count <= load_count + 1'b1;
+                            else if (!inputs_loaded) begin
+                                // 4 loads fill one row of A
+                                a_row[{load_count[1:0], 2'b00} +: 4] <= ui_in[3:0];
+
+                                if (load_count[1:0] == 2'd3) begin
+                                    inputs_loaded <= 1'b1;
+                                    load_count    <= 4'd0;
+                                end
+                                else begin
+                                    load_count <= load_count + 1'b1;
+                                end
                             end
                         end
 
                         if ((uio_in[1:0] == CMD_START) &&
-                            inputs_loaded) begin
+                            weights_loaded && inputs_loaded) begin
 
-                            start        <= 1'b1;
-                            output_count <= 5'd0;
-                            state        <= ST_COMPUTE;
+                            start    <= 1'b1;
+                            byte_sel <= 1'b0;
+                            state    <= ST_COMPUTE;
                         end
                     end
 
                     ST_COMPUTE: begin
-                        // done may have pulsed while ena was low. Use the
-                        // sticky result_ready flag to resume correctly.
-                        if (done || result_ready) begin
-                            output_count <= 5'd0;
-                            state        <= ST_OUTPUT;
+                        // The element may have become ready while ena was
+                        // low. Use the sticky flag to resume correctly.
+                        if (elem_valid || result_ready) begin
+                            byte_sel <= 1'b0;
+                            state    <= ST_OUTPUT;
                         end
                     end
 
                     ST_OUTPUT: begin
                         if (uio_in[1:0] == CMD_READ) begin
-                            if (output_count == 5'd31) begin
-                                // All thirty-two result bytes were read
-                                state         <= ST_LOAD;
-                                load_count    <= 5'd0;
-                                inputs_loaded <= 1'b0;
-                                output_count  <= 5'd0;
-                                result_ready  <= 1'b0;
+                            if (!byte_sel) begin
+                                byte_sel <= 1'b1;
                             end
                             else begin
-                                output_count <= output_count + 1'b1;
+                                // High byte read: element finished
+                                byte_sel     <= 1'b0;
+                                result_ready <= 1'b0;
+
+                                if (last_col) begin
+                                    // Row of C complete: ask for the next A row
+                                    state         <= ST_LOAD;
+                                    load_count    <= 4'd0;
+                                    inputs_loaded <= 1'b0;
+
+                                    if (row_count == 2'd3) begin
+                                        // Whole matrix done: release B
+                                        row_count      <= 2'd0;
+                                        weights_loaded <= 1'b0;
+                                    end
+                                    else begin
+                                        row_count <= row_count + 1'b1;
+                                    end
+                                end
+                                else begin
+                                    state <= ST_COMPUTE;
+                                end
                             end
                         end
                     end
 
                     default: begin
-                        state         <= ST_LOAD;
-                        load_count    <= 5'd0;
-                        output_count  <= 5'd0;
-                        inputs_loaded <= 1'b0;
-                        start         <= 1'b0;
+                        state          <= ST_LOAD;
+                        load_count     <= 4'd0;
+                        byte_sel       <= 1'b0;
+                        inputs_loaded  <= 1'b0;
+                        start          <= 1'b0;
                     end
 
                 endcase
@@ -585,22 +568,12 @@ module tt_um_cnn_accelerator (
     end
 
     // ------------------------------------------------
-    // Output byte selection
-    //
-    // output_count[4:1] = element index (r*4 + c, row-major)
-    // output_count[0]   = 0: low byte, 1: high byte
-    // Each signed 10-bit element is sign-extended to 16 bits.
+    // Output byte selection: signed 10-bit element sign-extended to 16
     // ------------------------------------------------
-    wire [3:0] out_elem;
-    assign out_elem = output_count[4:1];
-
-    wire signed [9:0] sel_elem;
-    assign sel_elem = c_flat[out_elem * 10 +: 10];
-
     wire [7:0] selected_byte;
-    assign selected_byte = output_count[0]
-                         ? {{6{sel_elem[9]}}, sel_elem[9:8]}
-                         : sel_elem[7:0];
+    assign selected_byte = byte_sel
+                         ? {{6{elem_result[9]}}, elem_result[9:8]}
+                         : elem_result[7:0];
 
     assign uo_out =
         (ena && rst_n && state == ST_OUTPUT)
