@@ -9,12 +9,16 @@ CMD_LOAD = 0b01
 CMD_START = 0b10
 CMD_READ = 0b11
 
-# 4x4 matrix workload: C = A x B
+# 4x4 matrix multiply, C = A x B.
+# Weight-stationary protocol:
+#   LOAD x16  : B row-major
+#   for each row r of A:
+#       LOAD x4 : A[r][0..3]
+#       START
+#       for each column c: wait for result-valid, READ x2 (low, high byte)
 N = 4
-NUM_LOADS = 2 * N * N      # 16 values of A + 16 values of B
-NUM_READ_BYTES = 2 * N * N  # 16 results x 2 bytes
-# Whole matrix takes ~98 core cycles; leave generous margin.
-COMPUTE_TIMEOUT = 250
+# One element takes ~6 core cycles; leave generous margin.
+ELEMENT_TIMEOUT = 60
 
 
 async def tick(dut):
@@ -43,21 +47,6 @@ def matmul(a, b):
     ]
 
 
-def flatten(m):
-    return [v for row in m for v in row]
-
-
-def unflatten(v):
-    return [list(v[r * N:(r + 1) * N]) for r in range(N)]
-
-
-def decode_matrix(data):
-    """32 result bytes (lo, hi per element, row-major) -> 4x4 signed matrix."""
-    assert len(data) == NUM_READ_BYTES
-    flat = [signed16(data[2 * i] | (data[2 * i + 1] << 8)) for i in range(N * N)]
-    return unflatten(flat)
-
-
 async def idle_cycle(dut):
     dut.ui_in.value = 0
     dut.uio_in.value = CMD_IDLE
@@ -72,30 +61,35 @@ async def send_command(dut, command, data=0):
     await idle_cycle(dut)
 
 
-async def load_inputs(dut, a, b):
-    """Load matrix A then matrix B, each row-major (32 LOAD commands)."""
-    values = flatten(a) + flatten(b)
-    assert len(values) == NUM_LOADS
+async def load_b(dut, b):
+    """Load B (weights) row-major: 16 LOAD commands."""
+    for row in b:
+        for value in row:
+            await send_command(dut, CMD_LOAD, encode_int4(value))
 
-    for value in values:
+
+async def load_a_row(dut, a_row):
+    """Load one row of A: 4 LOAD commands."""
+    assert len(a_row) == N
+    for value in a_row:
         await send_command(dut, CMD_LOAD, encode_int4(value))
 
 
-async def wait_for_output(dut, timeout_cycles=COMPUTE_TIMEOUT):
-    """Wait for output_valid, then let wrapper enter its output state."""
+async def wait_for_output(dut, timeout_cycles=ELEMENT_TIMEOUT):
+    """Wait for result-valid, then let wrapper enter its output state."""
     for _ in range(timeout_cycles):
         await tick(dut)
         status = int(dut.uio_out.value)
 
-        # Wrapper maps output_valid to uio_out[3].
+        # Wrapper maps element-valid to uio_out[3].
         if status & 0x08:
-            # The wrapper observes done and transitions to ST_OUTPUT
+            # The wrapper observes valid and transitions to ST_OUTPUT
             # on the following clock edge.
             await tick(dut)
             return
 
     raise AssertionError(
-        f"Timed out waiting for output_valid after {timeout_cycles} cycles"
+        f"Timed out waiting for result-valid after {timeout_cycles} cycles"
     )
 
 
@@ -106,9 +100,11 @@ async def read_byte(dut):
     return value
 
 
-async def read_matrix(dut):
-    data = [await read_byte(dut) for _ in range(NUM_READ_BYTES)]
-    return decode_matrix(data), data
+async def read_element(dut):
+    """Read one signed 10-bit result (sent as low byte, high byte)."""
+    lo = await read_byte(dut)
+    hi = await read_byte(dut)
+    return signed16(lo | (hi << 8))
 
 
 async def reset_dut(dut):
@@ -127,21 +123,27 @@ async def reset_dut(dut):
         await idle_cycle(dut)
 
 
-async def run_case(dut, test_id, a, b):
-    """Run one 4x4 INT4 matrix multiply and compare all sixteen results."""
+async def run_matrix(dut, test_id, a, b):
+    """Run one full 4x4 INT4 matrix multiply and compare all 16 results."""
     expected = matmul(a, b)
 
     dut._log.info("Test %d: A=%s, B=%s", test_id, a, b)
     dut._log.info("Expected C: %s", expected)
 
-    await load_inputs(dut, a, b)
-    await send_command(dut, CMD_START)
-    await wait_for_output(dut)
+    await load_b(dut, b)
 
-    actual, data = await read_matrix(dut)
+    actual = []
+    for r in range(N):
+        await load_a_row(dut, a[r])
+        await send_command(dut, CMD_START)
+
+        row = []
+        for _ in range(N):
+            await wait_for_output(dut)
+            row.append(await read_element(dut))
+        actual.append(row)
 
     dut._log.info("Received C: %s", actual)
-    dut._log.info("Output bytes: %s", " ".join(f"{x:02X}" for x in data))
 
     assert actual == expected, (
         f"Test {test_id} failed: expected {expected}, got {actual}"
@@ -201,17 +203,16 @@ async def test_int4_matrix_multiply_4x4(dut):
     ]
 
     for test_id, (a, b) in enumerate(test_vectors, start=1):
-        await run_case(dut, test_id, a, b)
+        await run_matrix(dut, test_id, a, b)
 
     dut._log.info("ALL TESTS PASSED: %d/%d", len(test_vectors), len(test_vectors))
 
 
 @cocotb.test()
 async def test_ena_low_during_completion(dut):
-    """Completion must be retained if ena is low during the done pulse."""
+    """An element that completes while ena is low must not be lost."""
     await reset_dut(dut)
 
-    # Include the arithmetic extremum: (-8)*(-8)*4 = +256 on row 0.
     a = [[-8, -8, -8, -8],
          [7, 7, 7, 7],
          [0, 1, 2, 3],
@@ -222,18 +223,17 @@ async def test_ena_low_during_completion(dut):
          [-8, 7, -4, 5]]
     expected = matmul(a, b)
 
-    await load_inputs(dut, a, b)
+    await load_b(dut, b)
+    await load_a_row(dut, a[0])
     await send_command(dut, CMD_START)
 
     # The wrapper has accepted START and the core is running. Disable the
-    # wrapper now, before completion can occur, and keep it disabled while
+    # wrapper now, before the element completes, and keep it disabled while
     # the core finishes independently of ena.
     dut.ena.value = 0
 
-    # Wait for completion status while ena is still low. The whole matrix
-    # takes ~98 core cycles, so allow a bounded, generous wait.
     saw_valid = False
-    for _ in range(COMPUTE_TIMEOUT):
+    for _ in range(ELEMENT_TIMEOUT):
         await tick(dut)
         if int(dut.uio_out.value) & 0x08:
             saw_valid = True
@@ -243,30 +243,39 @@ async def test_ena_low_during_completion(dut):
         "result-valid never asserted while ena was low during computation"
     )
 
-    # Allow the controller's one-cycle done pulse to end. The wrapper must
-    # have latched result_ready and retain it while ena remains low.
+    # The controller holds the element and the wrapper latches the flag, so
+    # result-valid must stay asserted while ena remains low.
     for _ in range(3):
         await tick(dut)
         assert int(dut.uio_out.value) & 0x08, (
-            "result-valid did not remain asserted after done while ena was low"
+            "result-valid did not remain asserted while ena was low"
         )
 
     # Re-enable the wrapper. It must observe the latched completion and
-    # enter ST_OUTPUT rather than waiting forever for the expired done pulse.
+    # enter ST_OUTPUT rather than waiting forever.
     dut.ena.value = 1
     await tick(dut)
     assert int(dut.uio_out.value) & 0x08, (
         "result-valid was not retained after ena was re-enabled"
     )
 
-    actual, _ = await read_matrix(dut)
-    assert actual == expected, (
-        f"ena-low completion test failed: expected {expected}, got {actual}"
+    first = await read_element(dut)
+    assert first == expected[0][0], (
+        f"ena-low completion test failed: expected {expected[0][0]}, got {first}"
     )
     assert not (int(dut.uio_out.value) & 0x08), (
-        "result-valid should deassert after the final result byte is read"
+        "result-valid should deassert after the element has been read"
     )
-    dut._log.info("ENA-LOW COMPLETION TEST PASSED: C=%s", actual)
+
+    # The rest of row 0 must still come out correctly.
+    row = [first]
+    for _ in range(N - 1):
+        await wait_for_output(dut)
+        row.append(await read_element(dut))
+    assert row == expected[0], (
+        f"ena-low row check failed: expected {expected[0]}, got {row}"
+    )
+    dut._log.info("ENA-LOW COMPLETION TEST PASSED: row 0 = %s", row)
 
 
 def assert_status(dut, expected_busy, expected_valid, context):
@@ -291,7 +300,7 @@ def assert_status(dut, expected_busy, expected_valid, context):
 
 @cocotb.test()
 async def test_status_signals(dut):
-    """Check busy, result-valid and output enables across one transaction."""
+    """Check busy, result-valid and output enables across one matrix multiply."""
     cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
 
     dut.rst_n.value = 0
@@ -302,7 +311,6 @@ async def test_status_signals(dut):
     for _ in range(5):
         await tick(dut)
 
-    # The output-enable pins are statically configured and status starts idle.
     assert_status(dut, expected_busy=False, expected_valid=False,
                   context="during reset")
 
@@ -324,97 +332,84 @@ async def test_status_signals(dut):
          [4, -3, 0, 2]]
     expected = matmul(a, b)
 
-    await load_inputs(dut, a, b)
+    await load_b(dut, b)
     assert_status(dut, expected_busy=False, expected_valid=False,
-                  context="after loading inputs")
+                  context="after loading B")
 
-    await send_command(dut, CMD_START)
+    for r in range(N):
+        await load_a_row(dut, a[r])
+        assert_status(dut, expected_busy=False, expected_valid=False,
+                      context=f"after loading A row {r}")
 
-    # The wrapper registers the start pulse and the controller consumes it
-    # on a later rising edge. Require busy to assert within a bounded
-    # number of cycles rather than sampling it immediately after START.
-    busy_seen = False
-    for _ in range(4):
-        status = int(dut.uio_out.value)
-        output_enable = int(dut.uio_oe.value)
-        assert output_enable == 0x0C, (
-            f"after START: expected uio_oe=0x0C, got 0x{output_enable:02X}"
-        )
-        assert status & 0xF3 == 0, (
-            f"after START: reserved status bits are nonzero: 0x{status:02X}"
-        )
-        assert not (status & 0x08), (
-            "result-valid asserted before computation completed"
-        )
-        if status & 0x04:
-            busy_seen = True
-            break
-        await tick(dut)
+        await send_command(dut, CMD_START)
 
-    assert busy_seen, "busy did not assert within 4 cycles after START"
-    assert_status(dut, expected_busy=True, expected_valid=False,
-                  context="computation started")
+        # The wrapper registers the start pulse and the controller consumes
+        # it on a later rising edge. Require busy to assert within a bounded
+        # number of cycles rather than sampling it immediately after START.
+        busy_seen = False
+        for _ in range(4):
+            status = int(dut.uio_out.value)
+            assert not (status & 0x08), (
+                "result-valid asserted before computation completed"
+            )
+            if status & 0x04:
+                busy_seen = True
+                break
+            await tick(dut)
+        assert busy_seen, f"row {r}: busy did not assert within 4 cycles after START"
 
-    # While there is no result yet, busy should remain asserted. At completion
-    # the controller's FINISH state deasserts busy as result-valid asserts.
-    found_valid = False
-    for _ in range(COMPUTE_TIMEOUT):
-        status = int(dut.uio_out.value)
-        output_enable = int(dut.uio_oe.value)
-        assert output_enable == 0x0C, (
-            f"during computation: expected uio_oe=0x0C, got 0x{output_enable:02X}"
-        )
-        assert status & 0xF3 == 0, (
-            f"during computation: reserved status bits are nonzero: 0x{status:02X}"
-        )
+        for c in range(N):
+            # While waiting for the element, busy stays high.
+            found_valid = False
+            for _ in range(ELEMENT_TIMEOUT):
+                status = int(dut.uio_out.value)
+                assert status & 0xF3 == 0, (
+                    f"reserved status bits are nonzero: 0x{status:02X}"
+                )
+                assert int(dut.uio_oe.value) == 0x0C
+                if status & 0x08:
+                    found_valid = True
+                    break
+                assert status & 0x04, (
+                    "busy deasserted before result-valid asserted"
+                )
+                await tick(dut)
+            assert found_valid, "Timed out waiting for result-valid status"
 
-        if status & 0x08:
-            found_valid = True
-            break
-
-        assert status & 0x04, (
-            "busy deasserted before result-valid asserted"
-        )
-        await tick(dut)
-
-    assert found_valid, "Timed out waiting for result-valid status"
-
-    # Allow the wrapper to consume completion and enter ST_OUTPUT.
-    await tick(dut)
-    assert_status(dut, expected_busy=False, expected_valid=True,
-                  context="result available")
-
-    # Check that the status remains valid while all result bytes are read.
-    expected_bytes = []
-    for result in flatten(expected):
-        result_u16 = result & 0xFFFF
-        expected_bytes.extend([result_u16 & 0xFF, (result_u16 >> 8) & 0xFF])
-
-    last = NUM_READ_BYTES - 1
-    for index, expected_byte in enumerate(expected_bytes):
-        assert_status(dut, expected_busy=False, expected_valid=True,
-                      context=f"before reading result byte {index}")
-        actual_byte = await read_byte(dut)
-        assert actual_byte == expected_byte, (
-            f"result byte {index}: expected 0x{expected_byte:02X}, "
-            f"got 0x{actual_byte:02X}"
-        )
-
-        if index < last:
+            # Allow the wrapper to consume completion and enter ST_OUTPUT.
+            await tick(dut)
             assert_status(dut, expected_busy=False, expected_valid=True,
-                          context=f"after reading result byte {index}")
-        else:
-            assert_status(dut, expected_busy=False, expected_valid=False,
-                          context="after reading the final result byte")
+                          context=f"C[{r}][{c}] available")
+
+            expected_u16 = expected[r][c] & 0xFFFF
+            lo = await read_byte(dut)
+            assert lo == (expected_u16 & 0xFF), (
+                f"C[{r}][{c}] low byte: expected 0x{expected_u16 & 0xFF:02X}, got 0x{lo:02X}"
+            )
+            assert_status(dut, expected_busy=False, expected_valid=True,
+                          context=f"C[{r}][{c}] after low byte")
+
+            hi = await read_byte(dut)
+            assert hi == ((expected_u16 >> 8) & 0xFF), (
+                f"C[{r}][{c}] high byte: expected 0x{(expected_u16 >> 8) & 0xFF:02X}, got 0x{hi:02X}"
+            )
+
+            if c < N - 1:
+                # Next element is already being computed.
+                assert_status(dut, expected_busy=True, expected_valid=False,
+                              context=f"after reading C[{r}][{c}]")
+            else:
+                assert_status(dut, expected_busy=False, expected_valid=False,
+                              context=f"after reading row {r}")
 
     dut._log.info(
-        "STATUS SIGNAL TEST PASSED: busy, result_valid, uio_oe, and result-byte lifetime verified"
+        "STATUS SIGNAL TEST PASSED: busy, result_valid, uio_oe and byte protocol verified"
     )
 
 
 @cocotb.test()
 async def test_reset_during_compute_and_recovery(dut):
-    """Reset during an active computation, then verify a fresh transaction."""
+    """Reset during an active computation, then verify a fresh matrix multiply."""
     cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
 
     dut.rst_n.value = 0
@@ -434,10 +429,10 @@ async def test_reset_during_compute_and_recovery(dut):
     for _ in range(2):
         await idle_cycle(dut)
 
-    # Start a transaction, then reset it before the computation completes.
-    first_a = [[7, -8, 3, -2]] * N
+    # Start a transaction, then reset it before it completes.
     first_b = [[1] * N for _ in range(N)]
-    await load_inputs(dut, first_a, first_b)
+    await load_b(dut, first_b)
+    await load_a_row(dut, [7, -8, 3, -2])
     await send_command(dut, CMD_START)
 
     busy_seen = False
@@ -450,9 +445,7 @@ async def test_reset_during_compute_and_recovery(dut):
     assert busy_seen, (
         "busy did not assert before the mid-computation reset"
     )
-    # Keep the reset in the middle of the operation (matrix takes ~98
-    # cycles), not at completion. 40 cycles lands mid-way through C.
-    for _ in range(40):
+    for _ in range(10):
         await tick(dut)
 
     dut.rst_n.value = 0
@@ -472,7 +465,6 @@ async def test_reset_during_compute_and_recovery(dut):
         f"expected uio_oe=0x0C during reset, got 0x{int(dut.uio_oe.value):02X}"
     )
 
-    # Release reset and ensure no stale completion/result-valid remains.
     dut.rst_n.value = 1
     for _ in range(2):
         await idle_cycle(dut)
@@ -481,7 +473,7 @@ async def test_reset_during_compute_and_recovery(dut):
         context="idle after mid-computation reset"
     )
 
-    # Run a different transaction to prove the design can recover normally.
+    # A complete, different matrix multiply must work after the reset.
     a = [[2, -3, 4, -1],
          [1, 1, 1, 1],
          [-8, 7, -8, 7],
@@ -490,29 +482,18 @@ async def test_reset_during_compute_and_recovery(dut):
          [3, -3, 2, 1],
          [0, 4, -4, 2],
          [-2, 1, 5, 0]]
-    expected = matmul(a, b)
+    await run_matrix(dut, 1, a, b)
 
-    await load_inputs(dut, a, b)
-    await send_command(dut, CMD_START)
-    await wait_for_output(dut)
-
-    actual, _ = await read_matrix(dut)
-    assert actual == expected, (
-        f"post-reset transaction failed: expected {expected}, got {actual}"
-    )
     assert_status(
         dut, expected_busy=False, expected_valid=False,
-        context="after post-reset transaction is fully read"
+        context="after post-reset matrix multiply"
     )
-    dut._log.info(
-        "RESET RECOVERY TEST PASSED: reset aborted an in-flight transaction; "
-        "a new transaction returned %s", actual
-    )
+    dut._log.info("RESET RECOVERY TEST PASSED")
 
 
 @cocotb.test()
 async def test_repeated_transactions_without_reset(dut):
-    """Run two complete transactions back-to-back without resetting the DUT."""
+    """Run two complete matrix multiplies back-to-back without resetting."""
     await reset_dut(dut)
 
     transactions = [
@@ -522,33 +503,17 @@ async def test_repeated_transactions_without_reset(dut):
     ]
 
     for tx_id, (a, b) in enumerate(transactions, start=1):
-        expected = matmul(a, b)
         assert_status(
             dut, expected_busy=False, expected_valid=False,
             context=f"before transaction {tx_id}"
         )
-
-        await load_inputs(dut, a, b)
-        await send_command(dut, CMD_START)
-        await wait_for_output(dut)
-        assert_status(
-            dut, expected_busy=False, expected_valid=True,
-            context=f"result available for transaction {tx_id}"
-        )
-
-        actual, _ = await read_matrix(dut)
-        assert actual == expected, (
-            f"transaction {tx_id}: expected {expected}, got {actual}"
-        )
+        await run_matrix(dut, tx_id, a, b)
         assert_status(
             dut, expected_busy=False, expected_valid=False,
-            context=f"after transaction {tx_id} results are read"
-        )
-        dut._log.info(
-            "REPEATED TRANSACTION %d PASSED: C=%s", tx_id, actual
+            context=f"after transaction {tx_id}"
         )
 
-    dut._log.info("REPEATED TRANSACTIONS TEST PASSED: 2 transactions without reset")
+    dut._log.info("REPEATED TRANSACTIONS TEST PASSED: 2 matrix multiplies without reset")
 
 
 @cocotb.test()
@@ -567,7 +532,7 @@ async def test_deterministic_randomized_matrices(dut):
     for vector_id in range(1, vector_count + 1):
         a = [[rng.randint(-8, 7) for _ in range(N)] for _ in range(N)]
         b = [[rng.randint(-8, 7) for _ in range(N)] for _ in range(N)]
-        await run_case(dut, vector_id, a, b)
+        await run_matrix(dut, vector_id, a, b)
 
     dut._log.info(
         "DETERMINISTIC RANDOMIZED REGRESSION PASSED: %d matrix pairs, seed=0x%X",
