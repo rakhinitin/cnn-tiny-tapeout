@@ -9,6 +9,13 @@ CMD_LOAD = 0b01
 CMD_START = 0b10
 CMD_READ = 0b11
 
+# 4x4 matrix workload: C = A x B
+N = 4
+NUM_LOADS = 2 * N * N      # 16 values of A + 16 values of B
+NUM_READ_BYTES = 2 * N * N  # 16 results x 2 bytes
+# Whole matrix takes ~98 core cycles; leave generous margin.
+COMPUTE_TIMEOUT = 250
+
 
 async def tick(dut):
     """Wait for one rising edge and allow nonblocking assignments to settle."""
@@ -28,6 +35,29 @@ def signed16(value):
     return value - 0x10000 if value & 0x8000 else value
 
 
+def matmul(a, b):
+    """Reference model: C[r][c] = sum_k A[r][k] * B[k][c]."""
+    return [
+        [sum(a[r][k] * b[k][c] for k in range(N)) for c in range(N)]
+        for r in range(N)
+    ]
+
+
+def flatten(m):
+    return [v for row in m for v in row]
+
+
+def unflatten(v):
+    return [list(v[r * N:(r + 1) * N]) for r in range(N)]
+
+
+def decode_matrix(data):
+    """32 result bytes (lo, hi per element, row-major) -> 4x4 signed matrix."""
+    assert len(data) == NUM_READ_BYTES
+    flat = [signed16(data[2 * i] | (data[2 * i + 1] << 8)) for i in range(N * N)]
+    return unflatten(flat)
+
+
 async def idle_cycle(dut):
     dut.ui_in.value = 0
     dut.uio_in.value = CMD_IDLE
@@ -42,16 +72,16 @@ async def send_command(dut, command, data=0):
     await idle_cycle(dut)
 
 
-async def load_inputs(dut, features, weights):
-    """Load features 0..3, followed by weights 0..3."""
-    assert len(features) == 4
-    assert len(weights) == 4
+async def load_inputs(dut, a, b):
+    """Load matrix A then matrix B, each row-major (32 LOAD commands)."""
+    values = flatten(a) + flatten(b)
+    assert len(values) == NUM_LOADS
 
-    for value in list(features) + list(weights):
+    for value in values:
         await send_command(dut, CMD_LOAD, encode_int4(value))
 
 
-async def wait_for_output(dut, timeout_cycles=60):
+async def wait_for_output(dut, timeout_cycles=COMPUTE_TIMEOUT):
     """Wait for output_valid, then let wrapper enter its output state."""
     for _ in range(timeout_cycles):
         await tick(dut)
@@ -76,32 +106,42 @@ async def read_byte(dut):
     return value
 
 
-async def run_case(dut, test_id, features, weights):
-    """Run one 4x4 INT4 case and compare all four 16-bit results."""
-    weight_sum = sum(weights)
-    expected = [feature * weight_sum for feature in features]
+async def read_matrix(dut):
+    data = [await read_byte(dut) for _ in range(NUM_READ_BYTES)]
+    return decode_matrix(data), data
 
-    dut._log.info(
-        "Test %d: features=%s, weights=%s, weight_sum=%d",
-        test_id, features, weights, weight_sum
-    )
-    dut._log.info("Expected outputs: %s", expected)
 
-    await load_inputs(dut, features, weights)
+async def reset_dut(dut):
+    cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
+
+    dut.rst_n.value = 0
+    dut.ena.value = 0
+    dut.ui_in.value = 0
+    dut.uio_in.value = CMD_IDLE
+    for _ in range(5):
+        await tick(dut)
+
+    dut.rst_n.value = 1
+    dut.ena.value = 1
+    for _ in range(2):
+        await idle_cycle(dut)
+
+
+async def run_case(dut, test_id, a, b):
+    """Run one 4x4 INT4 matrix multiply and compare all sixteen results."""
+    expected = matmul(a, b)
+
+    dut._log.info("Test %d: A=%s, B=%s", test_id, a, b)
+    dut._log.info("Expected C: %s", expected)
+
+    await load_inputs(dut, a, b)
     await send_command(dut, CMD_START)
     await wait_for_output(dut)
 
-    # Read order: output_0 low/high, ..., output_3 low/high.
-    data = [await read_byte(dut) for _ in range(8)]
-    actual = [
-        signed16(data[0] | (data[1] << 8)),
-        signed16(data[2] | (data[3] << 8)),
-        signed16(data[4] | (data[5] << 8)),
-        signed16(data[6] | (data[7] << 8)),
-    ]
+    actual, data = await read_matrix(dut)
 
-    dut._log.info("Received outputs: %s", actual)
-    dut._log.info("Output bytes: %s", " ".join(f"{b:02X}" for b in data))
+    dut._log.info("Received C: %s", actual)
+    dut._log.info("Output bytes: %s", " ".join(f"{x:02X}" for x in data))
 
     assert actual == expected, (
         f"Test {test_id} failed: expected {expected}, got {actual}"
@@ -109,65 +149,80 @@ async def run_case(dut, test_id, features, weights):
     dut._log.info("Test %d PASSED", test_id)
 
 
+IDENTITY = [[1 if r == c else 0 for c in range(N)] for r in range(N)]
+
+
 @cocotb.test()
-async def test_int4_systolic_accelerator_4x4(dut):
-    """Verify the 4x4 signed INT4 systolic accelerator via TT wrapper."""
-    cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
+async def test_int4_matrix_multiply_4x4(dut):
+    """Verify C = A x B for 4x4 signed INT4 matrices via the TT wrapper."""
+    await reset_dut(dut)
 
-    dut.rst_n.value = 0
-    dut.ena.value = 0
-    dut.ui_in.value = 0
-    dut.uio_in.value = CMD_IDLE
-
-    for _ in range(5):
-        await tick(dut)
-
-    dut.rst_n.value = 1
-    dut.ena.value = 1
-    for _ in range(2):
-        await idle_cycle(dut)
-
-    # Each tuple is (features[0:4], weights[0:4]).
-    # The RTL computes output_r = feature_r * sum(weights).
+    # Each tuple is (A, B); expected result is computed by matmul().
     test_vectors = [
-        ([1, 2, 3, 4], [1, 2, -1, 1]),       # weight sum = 3
-        ([2, -3, 7, -8], [4, -2, 1, -1]),    # mixed signed values
-        ([7, -8, 0, -1], [7, 7, 7, 7]),      # maximum positive weights
-        ([-8, 7, -5, 3], [-8, -8, -8, -8]),  # includes output +256
-        ([-8, -1, 1, 7], [-8, 7, -8, 7]),    # alternating boundaries
-        ([-8, -1, 0, 7], [0, 0, 0, 0]),      # zero weights
-        ([-7, 5, -2, 6], [-3, 2, 4, -1]),    # mixed-sign arithmetic
+        # Small positive numbers
+        ([[1, 2, 3, 4],
+          [5, 6, 7, 1],
+          [2, 3, 4, 5],
+          [6, 7, 1, 2]],
+         [[1, 0, 2, 1],
+          [3, 1, 0, 2],
+          [0, 2, 1, 3],
+          [1, 1, 1, 0]]),
+        # Mixed signed values
+        ([[2, -3, 7, -8],
+          [-1, 4, -5, 6],
+          [3, 3, -3, -3],
+          [-7, 0, 5, 1]],
+         [[4, -2, 1, -1],
+          [0, 3, -4, 2],
+          [-6, 5, 2, 7],
+          [1, -8, 3, -3]]),
+        # Maximum positive operands
+        ([[7] * N for _ in range(N)], [[7] * N for _ in range(N)]),
+        # (-8)*(-8)*4 = +256 in every element (accumulator extreme)
+        ([[-8] * N for _ in range(N)], [[-8] * N for _ in range(N)]),
+        # Most negative result: (-8)*7*4 = -224
+        ([[-8] * N for _ in range(N)], [[7] * N for _ in range(N)]),
+        # Zero B matrix
+        ([[-8, -1, 0, 7]] * N, [[0] * N for _ in range(N)]),
+        # Zero A matrix
+        ([[0] * N for _ in range(N)], [[-3, 2, 4, -1]] * N),
+        # Identity checks guard against transposed row/column ordering:
+        # A x I = A  and  I x B = B
+        ([[1, -2, 3, -4],
+          [5, -6, 7, -8],
+          [-1, 2, -3, 4],
+          [-5, 6, -7, 0]], IDENTITY),
+        (IDENTITY,
+         [[1, -2, 3, -4],
+          [5, -6, 7, -8],
+          [-1, 2, -3, 4],
+          [-5, 6, -7, 0]]),
     ]
 
-    for test_id, (features, weights) in enumerate(test_vectors, start=1):
-        await run_case(dut, test_id, features, weights)
+    for test_id, (a, b) in enumerate(test_vectors, start=1):
+        await run_case(dut, test_id, a, b)
 
     dut._log.info("ALL TESTS PASSED: %d/%d", len(test_vectors), len(test_vectors))
+
 
 @cocotb.test()
 async def test_ena_low_during_completion(dut):
     """Completion must be retained if ena is low during the done pulse."""
-    cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
+    await reset_dut(dut)
 
-    dut.rst_n.value = 0
-    dut.ena.value = 0
-    dut.ui_in.value = 0
-    dut.uio_in.value = CMD_IDLE
-    for _ in range(5):
-        await tick(dut)
+    # Include the arithmetic extremum: (-8)*(-8)*4 = +256 on row 0.
+    a = [[-8, -8, -8, -8],
+         [7, 7, 7, 7],
+         [0, 1, 2, 3],
+         [-1, -2, -3, -4]]
+    b = [[-8, 7, -1, 2],
+         [-8, 7, -2, 3],
+         [-8, 7, -3, 4],
+         [-8, 7, -4, 5]]
+    expected = matmul(a, b)
 
-    dut.rst_n.value = 1
-    dut.ena.value = 1
-    for _ in range(2):
-        await idle_cycle(dut)
-
-    # Include the arithmetic extrema exercised by the original regression:
-    # (-8) * (-8 - 8 - 8 - 8) = +256.
-    features = [-8, 7, 0, -1]
-    weights = [-8, -8, -8, -8]
-    expected = [feature * sum(weights) for feature in features]
-
-    await load_inputs(dut, features, weights)
+    await load_inputs(dut, a, b)
     await send_command(dut, CMD_START)
 
     # The wrapper has accepted START and the core is running. Disable the
@@ -175,11 +230,10 @@ async def test_ena_low_during_completion(dut):
     # the core finishes independently of ena.
     dut.ena.value = 0
 
-    # Wait for completion status while ena is still low. A bounded wait
-    # allows normal RTL/gate-level propagation differences without hiding a
-    # missing completion event.
+    # Wait for completion status while ena is still low. The whole matrix
+    # takes ~98 core cycles, so allow a bounded, generous wait.
     saw_valid = False
-    for _ in range(40):
+    for _ in range(COMPUTE_TIMEOUT):
         await tick(dut)
         if int(dut.uio_out.value) & 0x08:
             saw_valid = True
@@ -205,21 +259,14 @@ async def test_ena_low_during_completion(dut):
         "result-valid was not retained after ena was re-enabled"
     )
 
-    data = [await read_byte(dut) for _ in range(8)]
-    actual = [
-        signed16(data[0] | (data[1] << 8)),
-        signed16(data[2] | (data[3] << 8)),
-        signed16(data[4] | (data[5] << 8)),
-        signed16(data[6] | (data[7] << 8)),
-    ]
+    actual, _ = await read_matrix(dut)
     assert actual == expected, (
         f"ena-low completion test failed: expected {expected}, got {actual}"
     )
     assert not (int(dut.uio_out.value) & 0x08), (
         "result-valid should deassert after the final result byte is read"
     )
-    dut._log.info("ENA-LOW COMPLETION TEST PASSED: expected=%s actual=%s", expected, actual)
-
+    dut._log.info("ENA-LOW COMPLETION TEST PASSED: C=%s", actual)
 
 
 def assert_status(dut, expected_busy, expected_valid, context):
@@ -267,20 +314,24 @@ async def test_status_signals(dut):
     assert_status(dut, expected_busy=False, expected_valid=False,
                   context="idle after reset")
 
-    features = [1, 2, 3, 4]
-    weights = [1, 2, -1, 1]
-    expected_outputs = [feature * sum(weights) for feature in features]
+    a = [[1, 2, 3, 4],
+         [-1, -2, -3, -4],
+         [5, 0, -5, 2],
+         [7, -8, 6, -6]]
+    b = [[1, 2, -1, 1],
+         [0, 1, 2, 3],
+         [-2, 0, 1, -1],
+         [4, -3, 0, 2]]
+    expected = matmul(a, b)
 
-    await load_inputs(dut, features, weights)
+    await load_inputs(dut, a, b)
     assert_status(dut, expected_busy=False, expected_valid=False,
                   context="after loading inputs")
 
     await send_command(dut, CMD_START)
 
-    # The wrapper and controller are separate sequential blocks: the wrapper
-    # registers the start pulse, and the controller consumes it on a later
-    # rising edge. Gate-level simulation can expose that cycle of latency more
-    # clearly than RTL simulation. Require busy to assert within a bounded
+    # The wrapper registers the start pulse and the controller consumes it
+    # on a later rising edge. Require busy to assert within a bounded
     # number of cycles rather than sampling it immediately after START.
     busy_seen = False
     for _ in range(4):
@@ -307,7 +358,7 @@ async def test_status_signals(dut):
     # While there is no result yet, busy should remain asserted. At completion
     # the controller's FINISH state deasserts busy as result-valid asserts.
     found_valid = False
-    for _ in range(60):
+    for _ in range(COMPUTE_TIMEOUT):
         status = int(dut.uio_out.value)
         output_enable = int(dut.uio_oe.value)
         assert output_enable == 0x0C, (
@@ -333,12 +384,13 @@ async def test_status_signals(dut):
     assert_status(dut, expected_busy=False, expected_valid=True,
                   context="result available")
 
-    # Check that the status remains valid while all eight result bytes are read.
+    # Check that the status remains valid while all result bytes are read.
     expected_bytes = []
-    for result in expected_outputs:
+    for result in flatten(expected):
         result_u16 = result & 0xFFFF
         expected_bytes.extend([result_u16 & 0xFF, (result_u16 >> 8) & 0xFF])
 
+    last = NUM_READ_BYTES - 1
     for index, expected_byte in enumerate(expected_bytes):
         assert_status(dut, expected_busy=False, expected_valid=True,
                       context=f"before reading result byte {index}")
@@ -348,7 +400,7 @@ async def test_status_signals(dut):
             f"got 0x{actual_byte:02X}"
         )
 
-        if index < 7:
+        if index < last:
             assert_status(dut, expected_busy=False, expected_valid=True,
                           context=f"after reading result byte {index}")
         else:
@@ -358,6 +410,7 @@ async def test_status_signals(dut):
     dut._log.info(
         "STATUS SIGNAL TEST PASSED: busy, result_valid, uio_oe, and result-byte lifetime verified"
     )
+
 
 @cocotb.test()
 async def test_reset_during_compute_and_recovery(dut):
@@ -382,14 +435,11 @@ async def test_reset_during_compute_and_recovery(dut):
         await idle_cycle(dut)
 
     # Start a transaction, then reset it before the computation completes.
-    first_features = [7, -8, 3, -2]
-    first_weights = [1, 1, 1, 1]
-    await load_inputs(dut, first_features, first_weights)
+    first_a = [[7, -8, 3, -2]] * N
+    first_b = [[1] * N for _ in range(N)]
+    await load_inputs(dut, first_a, first_b)
     await send_command(dut, CMD_START)
 
-    # The controller should become active before we interrupt it. Use a
-    # bounded wait because gate-level simulation may expose extra signal
-    # propagation latency compared with RTL simulation.
     busy_seen = False
     for _ in range(4):
         if int(dut.uio_out.value) & 0x04:
@@ -400,8 +450,9 @@ async def test_reset_during_compute_and_recovery(dut):
     assert busy_seen, (
         "busy did not assert before the mid-computation reset"
     )
-    # Keep the reset in the middle of the operation, not at completion.
-    for _ in range(2):
+    # Keep the reset in the middle of the operation (matrix takes ~98
+    # cycles), not at completion. 40 cycles lands mid-way through C.
+    for _ in range(40):
         await tick(dut)
 
     dut.rst_n.value = 0
@@ -431,21 +482,21 @@ async def test_reset_during_compute_and_recovery(dut):
     )
 
     # Run a different transaction to prove the design can recover normally.
-    features = [2, -3, 4, -1]
-    weights = [1, 2, 0, -1]
-    expected = [feature * sum(weights) for feature in features]
+    a = [[2, -3, 4, -1],
+         [1, 1, 1, 1],
+         [-8, 7, -8, 7],
+         [0, 5, -5, 3]]
+    b = [[1, 2, 0, -1],
+         [3, -3, 2, 1],
+         [0, 4, -4, 2],
+         [-2, 1, 5, 0]]
+    expected = matmul(a, b)
 
-    await load_inputs(dut, features, weights)
+    await load_inputs(dut, a, b)
     await send_command(dut, CMD_START)
     await wait_for_output(dut)
 
-    data = [await read_byte(dut) for _ in range(8)]
-    actual = [
-        signed16(data[0] | (data[1] << 8)),
-        signed16(data[2] | (data[3] << 8)),
-        signed16(data[4] | (data[5] << 8)),
-        signed16(data[6] | (data[7] << 8)),
-    ]
+    actual, _ = await read_matrix(dut)
     assert actual == expected, (
         f"post-reset transaction failed: expected {expected}, got {actual}"
     )
@@ -459,37 +510,25 @@ async def test_reset_during_compute_and_recovery(dut):
     )
 
 
-
 @cocotb.test()
 async def test_repeated_transactions_without_reset(dut):
     """Run two complete transactions back-to-back without resetting the DUT."""
-    cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
-
-    dut.rst_n.value = 0
-    dut.ena.value = 0
-    dut.ui_in.value = 0
-    dut.uio_in.value = CMD_IDLE
-    for _ in range(5):
-        await tick(dut)
-
-    dut.rst_n.value = 1
-    dut.ena.value = 1
-    for _ in range(2):
-        await idle_cycle(dut)
+    await reset_dut(dut)
 
     transactions = [
-        ([1, 2, 3, 4], [1, 2, -1, 1]),
-        ([-8, 7, 0, -1], [-8, -8, -8, -8]),
+        ([[1, 2, 3, 4], [4, 3, 2, 1], [1, 0, -1, 0], [2, 2, 2, 2]],
+         [[1, 2, -1, 1], [0, 1, 0, 1], [3, -3, 2, 0], [1, 1, 1, 1]]),
+        ([[-8] * N for _ in range(N)], [[-8] * N for _ in range(N)]),
     ]
 
-    for tx_id, (features, weights) in enumerate(transactions, start=1):
-        expected = [feature * sum(weights) for feature in features]
+    for tx_id, (a, b) in enumerate(transactions, start=1):
+        expected = matmul(a, b)
         assert_status(
             dut, expected_busy=False, expected_valid=False,
             context=f"before transaction {tx_id}"
         )
 
-        await load_inputs(dut, features, weights)
+        await load_inputs(dut, a, b)
         await send_command(dut, CMD_START)
         await wait_for_output(dut)
         assert_status(
@@ -497,13 +536,7 @@ async def test_repeated_transactions_without_reset(dut):
             context=f"result available for transaction {tx_id}"
         )
 
-        data = [await read_byte(dut) for _ in range(8)]
-        actual = [
-            signed16(data[0] | (data[1] << 8)),
-            signed16(data[2] | (data[3] << 8)),
-            signed16(data[4] | (data[5] << 8)),
-            signed16(data[6] | (data[7] << 8)),
-        ]
+        actual, _ = await read_matrix(dut)
         assert actual == expected, (
             f"transaction {tx_id}: expected {expected}, got {actual}"
         )
@@ -512,46 +545,31 @@ async def test_repeated_transactions_without_reset(dut):
             context=f"after transaction {tx_id} results are read"
         )
         dut._log.info(
-            "REPEATED TRANSACTION %d PASSED: expected=%s actual=%s",
-            tx_id, expected, actual
+            "REPEATED TRANSACTION %d PASSED: C=%s", tx_id, actual
         )
 
     dut._log.info("REPEATED TRANSACTIONS TEST PASSED: 2 transactions without reset")
 
 
 @cocotb.test()
-async def test_deterministic_randomized_vectors(dut):
-    """Check reproducible pseudorandom signed-INT4 workloads against Python."""
-    cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
-
-    dut.rst_n.value = 0
-    dut.ena.value = 0
-    dut.ui_in.value = 0
-    dut.uio_in.value = CMD_IDLE
-    for _ in range(5):
-        await tick(dut)
-
-    dut.rst_n.value = 1
-    dut.ena.value = 1
-    for _ in range(2):
-        await idle_cycle(dut)
+async def test_deterministic_randomized_matrices(dut):
+    """Check reproducible pseudorandom signed-INT4 matrices against Python."""
+    await reset_dut(dut)
 
     seed = 0xC0C07B
     vector_count = 20
     rng = random.Random(seed)
     dut._log.info(
-        "Starting deterministic randomized INT4 regression: seed=0x%X, vectors=%d",
+        "Starting deterministic randomized INT4 matrix regression: seed=0x%X, vectors=%d",
         seed, vector_count
     )
 
     for vector_id in range(1, vector_count + 1):
-        features = [rng.randint(-8, 7) for _ in range(4)]
-        weights = [rng.randint(-8, 7) for _ in range(4)]
-        await run_case(
-            dut, vector_id, features, weights
-        )
+        a = [[rng.randint(-8, 7) for _ in range(N)] for _ in range(N)]
+        b = [[rng.randint(-8, 7) for _ in range(N)] for _ in range(N)]
+        await run_case(dut, vector_id, a, b)
 
     dut._log.info(
-        "DETERMINISTIC RANDOMIZED REGRESSION PASSED: %d vectors, seed=0x%X",
+        "DETERMINISTIC RANDOMIZED REGRESSION PASSED: %d matrix pairs, seed=0x%X",
         vector_count, seed
     )
