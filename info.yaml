@@ -1,9 +1,9 @@
 # Tiny Tapeout project information
 project:
-  title: "Resource-Shared 4x4 INT4 MAC Accelerator"
+  title: "Resource-Shared 4x4 INT4 Matrix Multiplier"
   author: "Varun K B"
   discord: ""
-  description: "A resource-shared INT4 MAC design that reuses four processing elements to produce four outputs sequentially."
+  description: "A signed INT4 4x4 matrix multiplier that reuses four processing elements to compute C = A x B sequentially."
   language: "Verilog"
   clock_hz: 50000000
   tiles: "1x1"
@@ -33,7 +33,7 @@ pinout:
   uio[0]: "Command bit 0"
   uio[1]: "Command bit 1"
   uio[2]: "Busy status output"
-  uio[3]: "Output-valid status output"
+  uio[3]: "Current matrix element result-valid status"
   uio[4]: "Unused"
   uio[5]: "Unused"
   uio[6]: "Unused"
