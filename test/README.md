@@ -1,17 +1,26 @@
 # Test and verification
 
-This directory contains the Cocotb testbench for `tt_um_cnn_accelerator`, the Tiny Tapeout wrapper for the resource-shared 4×4 signed INT4 MAC accelerator.
+This directory contains the Cocotb testbench for `tt_um_cnn_accelerator`, the Tiny Tapeout wrapper for the resource-shared 4×4 signed INT4 matrix-multiplication accelerator. The design computes `C = A × B` using four reused processing elements. Matrix B is loaded once, and rows of matrix A are streamed one at a time. The core calculates and returns the four elements of each C row sequentially.
 
 The functional regression contains six Cocotb tests:
 
-- `test_int4_systolic_accelerator_4x4`: checks seven directed signed-INT4 input/weight vectors against the reference equation `output[r] = feature[r] * sum(weights)`.
-- `test_ena_low_during_completion`: checks completion/result-valid retention when `ena` is low during completion, then verifies the four outputs.
-- `test_status_signals`: checks `busy`, result-valid, `uio_oe`, reserved status bits, and the byte-read protocol.
-- `test_reset_during_compute_and_recovery`: resets during an active computation and verifies that a fresh transaction succeeds afterward.
-- `test_repeated_transactions_without_reset`: runs two complete transactions without an intervening reset.
-- `test_deterministic_randomized_vectors`: checks 20 reproducible signed-INT4 vectors using seed `0xC0C07B`.
+- `test_int4_matrix_multiply_4x4`: checks directed 4×4 signed-INT4 matrix pairs against the Python reference equation `C[r][c] = sum(A[r][k] * B[k][c] for k in 0..3)`. All 16 elements are checked for each pair.
+- `test_ena_low_during_completion`: checks that an element completing while `ena` is low is not lost, then verifies the row results.
+- `test_status_signals`: checks `busy`, element result-valid, `uio_oe`, reserved status bits, and the byte-read protocol.
+- `test_reset_during_compute_and_recovery`: resets during an active computation and verifies that a fresh matrix multiplication succeeds afterward.
+- `test_repeated_transactions_without_reset`: runs complete matrix transactions without an intervening reset.
+- `test_deterministic_randomized_matrices`: checks reproducible signed-INT4 matrix pairs using seed `0xC0C07B`.
 
-The testbench exercises the Tiny Tapeout command interface using `uio_in[1:0]`: `00` = IDLE, `01` = LOAD, `10` = START, `11` = READ. Features and weights are loaded as signed INT4 nibbles through `ui_in[3:0]`. Each signed 10-bit result is read through the wrapper's byte-wise output protocol; the Cocotb helper interprets the returned words as signed 16-bit values.
+## Command and data protocol
+
+Commands use `uio_in[1:0]`: `00` = IDLE, `01` = LOAD, `10` = START, `11` = READ. Each command is followed by an IDLE cycle. Signed INT4 two's-complement nibbles are loaded through `ui_in[3:0]`; `ui_in[7:4]` is unused.
+
+1. Load all 16 values of matrix B in row-major order, one nibble per LOAD command.
+2. Load the four values of one row of matrix A, then issue START.
+3. Wait for `uio_out[3]` to indicate that the current result element is ready. Read that element using two READ commands: low byte, then high byte. Insert an IDLE cycle between commands.
+4. Repeat for the four columns of the current row, then load the next A row and repeat. B remains loaded across all four rows. The full C matrix consists of 16 signed 10-bit results, returned as 32 bytes.
+
+`uio_out[2]` is the busy status and `uio_out[3]` is per-element result-valid. Each signed 10-bit result is sign-extended to 16 bits for the byte-wise interface.
 
 ## Prerequisites
 
@@ -43,7 +52,7 @@ make
 python -m cocotb_tools.check_results results.xml
 ```
 
-Checking `results.xml` is important: the Makefile's simulator process may return success even when Cocotb has recorded a failed test. A successful regression should report all six Cocotb tests passing with zero failures.
+Checking `results.xml` is important: the Makefile's simulator process may return success even when Cocotb has recorded a failed test. Run the regression against the exact RTL revision you intend to tape out and confirm all six tests pass with zero failures. Historical pass results for an earlier RTL revision do not verify the current matrix-multiplication design.
 
 The testbench uses a 20 ns clock period to match the project's declared 50 MHz clock configuration. Functional simulation checks behavior; it is not a substitute for static timing analysis or physical-design sign-off.
 
