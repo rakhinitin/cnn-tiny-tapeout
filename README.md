@@ -170,9 +170,18 @@ For reproducibility, retain the run URL, full commit SHA, `src/config.json`, `in
 ## Project Team
 
 - [Varun K B](https://github.com/VarunKB06)
-- [ShreyasCN-19](https://github.com/ShreyasCN-19)
 - [rahular2005](https://github.com/rahular2005)
-- [thejasgowda-05](https://github.com/thejasgowda-05)
+
+## Authors
+
+- [Varun K B](https://github.com/VarunKB06)
+- [rahular2005](https://github.com/rahular2005)
+
+## Guide
+- Dr.Rakhi S
+
+## Institution
+- Atria Institute of Technology
 
 ## Acknowledgements
 
