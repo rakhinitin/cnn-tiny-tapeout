@@ -24,7 +24,7 @@ module tb ();
   wire VGND = 1'b0;
 `endif
 
-  tt_um_cnn_accelerator user_project (
+  tt_um_int4_matrix_multiplier user_project (
 `ifdef GL_TEST
       .VPWR(VPWR),
       .VGND(VGND),
