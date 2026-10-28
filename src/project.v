@@ -379,7 +379,7 @@ endmodule
 // After the 4th row has been read, B is released and the next matrix
 // multiply starts again with 16 B loads.
 // ============================================================
-module tt_um_cnn_accelerator (
+module tt_um_int4_matrix_multiplier (
     input  wire       clk,
     input  wire       rst_n,
     input  wire       ena,
